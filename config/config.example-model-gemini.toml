@@ -1,33 +1,52 @@
 # OpenManus configuration for Google Gemini (free tier, OpenAI-compatible API)
 #
-# Copy to config/config.toml and fill in your key:
+# Copy to config/config.toml:
 #     cp config/config.example-model-gemini.toml config/config.toml
 #
 #     export GEMINI_API_KEY="AIza..."
 #
+# ---------------------------------------------------------------------------
+# AUTOMATIC MODE
+# ---------------------------------------------------------------------------
+# `model = "auto"` means: OpenManus asks Gemini for the models that are
+# available *right now* (GET https://generativelanguage.googleapis.com/
+# v1beta/openai/models), drops the embedding and image generation models,
+# and picks the best chat model. No model name has to be maintained here.
+#
+# Every Gemini model accepts image input, so the vision tools work out of
+# the box.
+#
+# When the Gemini key is missing, invalid, rate limited or the quota is
+# exhausted, OpenManus rotates to the next model and then to the next
+# provider in the chain.
+#
 [llm]
-model = "gemini-2.5-flash"                                              # Free tier
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"   # OpenAI-compat endpoint
-api_key = "${GEMINI_API_KEY}"
+model = "auto"                                 # discover the models at runtime
+providers = ["gemini", "groq", "openrouter"]   # fallback order
 max_tokens = 8192
 temperature = 0.0
-# Every Gemini model accepts image input, so vision works out of the box.
-supports_images = true
+supports_images = true                         # every Gemini model sees images
 
-# Optional: a second profile with a different Gemini model.
-[llm.pro]
-model = "gemini-2.5-pro"
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-api_key = "${GEMINI_API_KEY}"
-max_tokens = 8192
-temperature = 0.0
+# The provider chain can also be restricted to Gemini only:
+# providers = ["gemini"]
 
-# Optional: a vision profile.
-[llm.vision]
-model = "gemini-2.5-flash"
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+[providers.gemini]
 api_key = "${GEMINI_API_KEY}"
-max_tokens = 8192
+max_candidates = 3      # how many Gemini models are kept as fallbacks
+free_only = true        # only use zero-cost models
+
+# Uncomment to add more providers to the chain.
+# [providers.groq]
+# api_key = "${GROQ_API_KEY}"
+#
+# [providers.openrouter]
+# api_key = "${OPENROUTER_API_KEY}"
+
+# Optional: a named profile with a smaller output budget.
+[llm.fast]
+model = "auto"
+providers = ["gemini", "groq"]
+max_tokens = 4096
 temperature = 0.0
 
 # Optional: MCP servers. Leave empty to run without MCP.

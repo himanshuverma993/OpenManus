@@ -180,8 +180,13 @@ python run_flow.py
 ## Running on Kaggle (free LLM APIs)
 
 OpenManus talks to every provider through the OpenAI-compatible Chat Completions
-API, so Groq, Google Gemini and OpenRouter all work by only changing
-`base_url` and `model` in `config/config.toml` - no code changes required.
+API, so Groq, Google Gemini and OpenRouter all work without any code change.
+
+**No model is ever selected by hand.** With `model = "auto"` OpenManus asks
+each provider for the models that are available *right now*, keeps the free
+ones that can do tool calling, and rotates to the next provider whenever the
+current one is unavailable, rate limited, exhausted or incompatible. A single
+working API key is enough to run OpenManus.
 
 Ready-to-use notebook: **`notebooks/OpenManus_Kaggle.ipynb`**
 
@@ -193,23 +198,64 @@ pip install -r requirements-kaggle.txt
 core agent needs (it skips `playwright`, `browsergym`, `crawl4ai`, `docker`,
 `boto3`, `pandas`, `pillow`, ...).
 
-### Provider configuration
+### Automatic model discovery and failover
 
-Copy the example that matches your provider and export the key:
+```toml
+[llm]
+model = "auto"                                 # discover the models at runtime
+providers = ["groq", "gemini", "openrouter"]   # fallback order
+max_tokens = 8192
+temperature = 0.0
+
+[providers.groq]
+api_key = "${GROQ_API_KEY}"
+max_candidates = 3
+free_only = true
+
+[providers.gemini]
+api_key = "${GEMINI_API_KEY}"
+
+[providers.openrouter]
+api_key = "${OPENROUTER_API_KEY}"
+```
+
+What happens at runtime:
+
+1. **Discovery** - `GET {base_url}/models` of every provider whose key was
+   found: `https://api.groq.com/openai/v1/models`,
+   `https://generativelanguage.googleapis.com/v1beta/openai/models` and
+   `https://openrouter.ai/api/v1/models`. The answer is cached under
+   `~/.cache/openmanus/models` (TTL: 6 h, override with
+   `OPENMANUS_MODEL_CACHE_TTL`).
+2. **Filtering** - non chat models (audio, TTS, embeddings, guard models) are
+   removed, models without tool calling support are removed, OpenRouter models
+   whose `pricing.prompt`/`pricing.completion` are not both `0` are removed
+   (the `:free` suffix never has to be hard coded), and models without the
+   `/api/v1/chat/completions` endpoint are removed.
+3. **Ranking** - explicit `prefer` entries first, then the cheapest models,
+   then the provider's own benchmark score, then a size heuristic.
+4. **Failover** - the request is sent to the first candidate. A provider level
+   problem (invalid key, rate limit, outage) moves on to the *next provider*,
+   a model level problem (rejected request, unusable answer) to the *next
+   model*. The output budget is clamped to the model's own limit, and
+   `messages[].name` is omitted because Groq rejects that field.
+
+Ready-made configurations:
 
 ```bash
-cp config/config.example-model-groq.toml       config/config.toml   # Groq
-cp config/config.example-model-gemini.toml     config/config.toml   # Gemini
+cp config/config.example-kaggle.toml          config/config.toml   # all three
+cp config/config.example-model-groq.toml       config/config.toml   # Groq only
+cp config/config.example-model-gemini.toml     config/config.toml   # Gemini only
 cp config/config.example-model-openrouter.toml config/config.toml   # OpenRouter
 
 export GROQ_API_KEY="gsk_..."       # or GEMINI_API_KEY / OPENROUTER_API_KEY
 ```
 
-| Provider | `base_url` | Suggested free model |
-|---|---|---|
-| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` (or `llama-3.1-8b-instant` for a bigger daily budget) |
-| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash` |
-| OpenRouter | `https://openrouter.ai/api/v1` | `google/gemini-2.5-flash:free` (only ~50 requests/day on the free tier) |
+| Provider | `base_url` | Discovery endpoint | Free tier notes |
+|---|---|---|---|
+| Groq | `https://api.groq.com/openai/v1` | `GET /openai/v1/models` | free tier, per-model rate limits; the catalogue changes often |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `GET /v1beta/openai/models` | free RPM/RPD quota, 1M context, image input |
+| OpenRouter | `https://openrouter.ai/api/v1` | `GET /api/v1/models` | `:free` models only, ~20 req/min and ~50 req/day without credits |
 
 ### Keeping secrets out of the config file
 
@@ -217,38 +263,43 @@ Any string in `config/config.toml` may contain an environment placeholder:
 
 ```toml
 [llm]
-model = "llama-3.3-70b-versatile"
-base_url = "https://api.groq.com/openai/v1"
+model = "auto"
+providers = ["groq"]
 api_key = "${GROQ_API_KEY}"      # resolved from the environment at load time
-max_tokens = 8192
-temperature = 0.0
 ```
 
 `${VAR}` and `${VAR:-fallback}` are supported. If `api_key` is omitted entirely,
-the `OPENMANUS_API_KEY` environment variable is used.
+the `OPENMANUS_API_KEY` environment variable is used. Groq reads `GROQ_API_KEY`,
+Gemini reads `GEMINI_API_KEY` or `GOOGLE_API_KEY`, OpenRouter reads
+`OPENROUTER_API_KEY`.
 
 ### Useful per-model options
 
 | Option | Meaning |
 |---|---|
-| `supports_images = true/false` | Force image input support on or off instead of auto-detecting it from the model name (Gemini and Groq's `llama-4-scout` are detected automatically). |
+| `model = "auto"` | Discover the usable models at runtime instead of using a fixed name. |
+| `providers = [...]` | Ordered fallback chain. Every provider needs its own key in `[providers.<name>]`. |
+| `max_candidates` | How many models of one provider are kept as fallbacks (default 3). |
+| `free_only` | Keep only zero-cost models (default `true`). |
+| `prefer = [...]` | Model ids that are tried first, in the given order. |
+| `max_retries` | Retries per candidate before the next one is used (default 2). |
+| `supports_images = true/false` | Force image input support on or off instead of auto-detecting it (Gemini and Groq's `llama-4-scout` are detected automatically). |
 | `temperature = "none"` | Leave the `temperature` parameter out of the request entirely - required by some reasoning models. |
 | `max_input_tokens = 50000` | Hard cap on the total input tokens used across a whole run. |
-| `max_tokens` | Output-token cap. Keep it below the provider's limit (e.g. Groq's `llama-4-scout` allows 8 192). |
+| `max_tokens` | Output-token cap. It is clamped automatically to the limit of the selected model. |
 | `[llm.extra_headers]` | Extra HTTP headers for every request, e.g. OpenRouter's `HTTP-Referer` / `X-Title`. |
 
-Named profiles let you switch models without editing the file, e.g.
+Named profiles let you switch chains without editing the file, e.g.
 
 ```toml
 [llm]
-model = "llama-3.3-70b-versatile"
-base_url = "https://api.groq.com/openai/v1"
-api_key = "${GROQ_API_KEY}"
+model = "auto"
+providers = ["groq", "gemini"]
 
 [llm.fast]
-model = "llama-3.1-8b-instant"
-base_url = "https://api.groq.com/openai/v1"
-api_key = "${GROQ_API_KEY}"
+model = "auto"
+providers = ["groq"]
+max_tokens = 4096
 ```
 
 ```python
@@ -266,6 +317,12 @@ llm = LLM(config_name="fast")
 * `tiktoken` downloads its BPE tables from `openaipublic.blob.core.windows.net` on
   first use. If that host is blocked, OpenManus falls back to an approximate
   tokenizer instead of failing to start.
+* The Docker sandbox needs a daemon, which Kaggle does not provide. Use the local
+  tools (`python_execute`, `str_replace`, ...) instead - set `use_sandbox = false`.
+* A model that answers with plain text instead of calling the `terminate` tool ends
+  the run immediately. Without that, every task would burn the full step budget
+  (20 requests) - fatal on OpenRouter's 50 requests/day free tier.
+
 ### Custom Adding Multiple Agents
 
 Currently, besides the general OpenManus Agent, we have also integrated the DataAnalysis Agent, which is suitable for data analysis and data visualization tasks. You can add this agent to `run_flow` in `config.toml`.

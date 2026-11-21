@@ -5,7 +5,11 @@ from pathlib import Path
 
 from loguru import logger as _logger
 
-from app.config import PROJECT_ROOT
+
+# The project root is computed locally instead of importing ``app.config``:
+# ``app.config`` imports ``app.providers`` and ``app.providers`` needs this
+# logger, so importing it here would create a circular import.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 _print_level = "INFO"

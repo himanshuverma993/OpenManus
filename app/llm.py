@@ -1,26 +1,29 @@
+import asyncio
+import inspect
 import math
 from typing import Dict, List, Optional, Union
 
 import tiktoken
 from openai import (
+    APIConnectionError,
     APIError,
+    APIStatusError,
+    APITimeoutError,
     AsyncAzureOpenAI,
     AsyncOpenAI,
     AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
     OpenAIError,
     RateLimitError,
 )
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_random_exponential,
-)
 
 from app.config import LLMSettings, config
-from app.exceptions import TokenLimitExceeded
+from app.exceptions import OutputTruncated, TokenLimitExceeded
 from app.logger import logger  # Assuming a logger is set up in your app
+from app.providers import Candidate, ProviderSpec, select_candidates
 from app.schema import (
     ROLE_VALUES,
     TOOL_CHOICE_TYPE,
@@ -270,6 +273,20 @@ class TokenCounter:
 
 
 class LLM:
+    """OpenAI-compatible chat client with automatic provider/model failover.
+
+    The client does not require the user to pick a model. When the
+    configuration declares one or more providers (see
+    :class:`app.config.ProviderSettings`), the models that are *actually*
+    available right now are discovered from the providers' own ``/models``
+    endpoints and turned into an ordered list of candidates. The first
+    candidate is used; whenever it fails (rate limit, outage, retired model,
+    rejected request, exhausted output budget) the next candidate is used.
+
+    This makes OpenManus work with a single API key for Groq, Gemini or
+    OpenRouter - and with several of them at the same time.
+    """
+
     _instances: Dict[str, "LLM"] = {}
 
     def __new__(
@@ -287,7 +304,10 @@ class LLM:
         if not hasattr(self, "client"):  # Only initialize if not already initialized
             llm_config = llm_config or config.llm
             llm_config = llm_config.get(config_name, llm_config["default"])
-            self.model = llm_config.model
+            self.config_name = config_name
+            self.llm_config = llm_config
+
+            self.configured_max_tokens = llm_config.max_tokens
             self.max_tokens = llm_config.max_tokens
             self.temperature = llm_config.temperature
             self.api_type = llm_config.api_type
@@ -295,6 +315,32 @@ class LLM:
             self.api_version = llm_config.api_version
             self.base_url = llm_config.base_url
             self.extra_headers = llm_config.extra_headers
+            self.send_message_name = bool(
+                getattr(llm_config, "send_message_name", False)
+            )
+            self.max_retries = max(1, int(getattr(llm_config, "max_retries", 2)))
+
+            # Add token counting related attributes
+            self.total_input_tokens = 0
+            self.total_completion_tokens = 0
+            self.max_input_tokens = (
+                llm_config.max_input_tokens
+                if hasattr(llm_config, "max_input_tokens")
+                else None
+            )
+
+            self._provider_specs = [
+                ProviderSpec(**provider.model_dump())
+                for provider in getattr(llm_config, "providers", []) or []
+            ]
+            self._candidates: List[Candidate] = []
+            self._candidate_index = 0
+            self._candidates_ready = False
+            self._candidate_lock = asyncio.Lock()
+            self._legacy_client = False
+            self._clients: Dict[str, object] = {}
+
+            self.model = llm_config.model
             self.is_reasoning_model = is_reasoning_model(self.model)
 
             # Image support can be forced on/off from the config file; when it is
@@ -306,15 +352,6 @@ class LLM:
                 else model_supports_images(self.model)
             )
 
-            # Add token counting related attributes
-            self.total_input_tokens = 0
-            self.total_completion_tokens = 0
-            self.max_input_tokens = (
-                llm_config.max_input_tokens
-                if hasattr(llm_config, "max_input_tokens")
-                else None
-            )
-
             # Initialize tokenizer (falls back to an offline approximation)
             self.tokenizer = load_tokenizer(self.model)
 
@@ -324,18 +361,265 @@ class LLM:
                     api_key=self.api_key,
                     api_version=self.api_version,
                 )
+                self._legacy_client = True
             elif self.api_type == "aws":
                 # Imported lazily so boto3 is only required for Bedrock users.
                 from app.bedrock import BedrockClient
 
                 self.client = BedrockClient()
+                self._legacy_client = True
             else:
-                client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
-                if self.extra_headers:
-                    client_kwargs["default_headers"] = self.extra_headers
-                self.client = AsyncOpenAI(**client_kwargs)
+                self.client = self._build_client(self.api_key, self.base_url)
 
             self.token_counter = TokenCounter(self.tokenizer)
+
+    # ------------------------------------------------------------------ #
+    # Provider / model resolution
+    # ------------------------------------------------------------------ #
+
+    def _build_client(self, api_key: str, base_url: str):
+        """Create (and cache) an OpenAI-compatible client for a provider.
+
+        ``max_retries=0`` is intentional: the failover logic of this class
+        decides how often a provider is retried. Letting the SDK retry on its
+        own would silently multiply the number of requests against a provider
+        that is already rate limited.
+        """
+        client_kwargs = {"api_key": api_key, "base_url": base_url, "max_retries": 0}
+        headers = self.extra_headers
+        if headers:
+            client_kwargs["default_headers"] = headers
+        return AsyncOpenAI(**client_kwargs)
+
+    def _client_for(self, provider: ProviderSpec):
+        key = f"{provider.name}|{provider.base_url}|{provider.api_key}"
+        client = self._clients.get(key)
+        if client is None:
+            client = AsyncOpenAI(
+                api_key=provider.api_key,
+                base_url=provider.base_url,
+                max_retries=0,
+                **(
+                    {"default_headers": provider.extra_headers}
+                    if provider.extra_headers
+                    else {}
+                ),
+            )
+            self._clients[key] = client
+        return client
+
+    async def _ensure_candidates(self) -> None:
+        """Resolve the usable (provider, model) candidates exactly once."""
+        if self._candidates_ready or self._legacy_client:
+            return
+        async with self._candidate_lock:
+            if self._candidates_ready:
+                return
+            await self._discover_candidates()
+            self._candidates_ready = True
+
+    async def _discover_candidates(self) -> None:
+        candidates: List[Candidate] = []
+        problems: List[str] = []
+
+        for spec in self._provider_specs:
+            if not spec.api_key:
+                problems.append(f"{spec.name}: no API key configured")
+                continue
+            if not spec.base_url:
+                problems.append(f"{spec.name}: no base_url configured")
+                continue
+            try:
+                provider_candidates = await asyncio.to_thread(select_candidates, spec)
+            except Exception as exc:
+                problems.append(f"{spec.name}: {exc}")
+                logger.warning(f"Provider '{spec.name}' is unusable: {exc}")
+                continue
+
+            candidates.extend(provider_candidates)
+            logger.info(
+                f"Provider '{spec.name}' offers: "
+                f"{[candidate.model for candidate in provider_candidates]}"
+            )
+
+        if not candidates:
+            raise RuntimeError(
+                "No usable LLM provider could be reached. " + "; ".join(problems)
+            )
+
+        self._candidates = candidates
+        self._activate(0)
+        logger.info(
+            "Active provider chain: " f"{[candidate.label for candidate in candidates]}"
+        )
+
+    def _activate(self, index: int) -> None:
+        """Switch the client, the model and the token limits to a candidate."""
+        candidate = self._candidates[index]
+        self._candidate_index = index
+        provider = candidate.provider
+
+        self.model = candidate.model
+        self.base_url = provider.base_url
+        self.api_key = provider.api_key
+        self.extra_headers = provider.extra_headers or None
+        self.is_reasoning_model = is_reasoning_model(candidate.model)
+
+        configured_image_support = getattr(self.llm_config, "supports_images", None)
+        self.supports_images = (
+            configured_image_support
+            if configured_image_support is not None
+            else (candidate.supports_images or model_supports_images(candidate.model))
+        )
+
+        # Never ask for more output tokens than the model allows.
+        limit = candidate.max_completion_tokens
+        self.max_tokens = (
+            min(self.configured_max_tokens, limit)
+            if limit
+            else self.configured_max_tokens
+        )
+
+        self.client = self._client_for(provider)
+
+    # ------------------------------------------------------------------ #
+    # Request execution with failover
+    # ------------------------------------------------------------------ #
+
+    async def _execute(self, build_params, consume, **kwargs):
+        """Run a request against the candidate chain.
+
+        ``build_params(candidate)`` returns the request parameters for a
+        candidate. ``consume(response)`` fully processes the response and
+        returns the final result. Both run *after* the candidate has been
+        activated, so model specific limits (such as the maximum number of
+        output tokens) and provider specific message rules are applied.
+        """
+        await self._ensure_candidates()
+
+        if self._legacy_client or not self._candidates:
+            params = build_params(None)
+            response = await self.client.chat.completions.create(**params, **kwargs)
+            result = consume(response)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
+        last_error: Optional[Exception] = None
+        total = len(self._candidates)
+        index = self._candidate_index
+        tried = 0
+
+        while tried < total:
+            tried += 1
+            candidate = self._candidates[index]
+            self._activate(index)
+            params = build_params(candidate)
+
+            # A provider level problem (bad key, rate limit, outage) must skip
+            # the remaining models of that provider, a model level problem
+            # (rejected request, unusable answer) continues with the next
+            # model of the same provider first.
+            skip_provider = False
+
+            attempt = 0
+            while attempt < self.max_retries:
+                attempt += 1
+                try:
+                    response = await self.client.chat.completions.create(
+                        **params, **kwargs
+                    )
+                    result = consume(response)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return result
+                except OutputTruncated as exc:
+                    last_error = exc
+                    logger.warning(
+                        f"Model '{candidate.model}' did not produce a usable "
+                        f"answer ({exc}). Trying the next model."
+                    )
+                    break
+                except ValueError:
+                    raise
+                except AuthenticationError as exc:
+                    last_error = exc
+                    skip_provider = True
+                    logger.warning(
+                        f"Provider '{candidate.provider.name}' rejected the API "
+                        f"key ({exc.__class__.__name__}). Trying the next provider."
+                    )
+                    break
+                except (BadRequestError, NotFoundError) as exc:
+                    last_error = exc
+                    logger.warning(
+                        f"Model '{candidate.model}' on "
+                        f"'{candidate.provider.name}' was rejected "
+                        f"({exc.__class__.__name__}: {exc}). Trying the next model."
+                    )
+                    break
+                except RateLimitError as exc:
+                    last_error = exc
+                    skip_provider = True
+                    logger.warning(
+                        f"Rate limited by '{candidate.provider.name}' on "
+                        f"'{candidate.model}'. Trying the next provider."
+                    )
+                    break
+                except (
+                    APIConnectionError,
+                    APITimeoutError,
+                    InternalServerError,
+                ) as exc:
+                    last_error = exc
+                    if attempt < self.max_retries:
+                        await asyncio.sleep(min(2**attempt, 10))
+                        continue
+                    skip_provider = True
+                    logger.warning(
+                        f"Provider '{candidate.provider.name}' is unreachable "
+                        f"({exc.__class__.__name__}). Trying the next provider."
+                    )
+                    break
+                except APIStatusError as exc:
+                    last_error = exc
+                    if exc.status_code >= 500 and attempt < self.max_retries:
+                        await asyncio.sleep(min(2**attempt, 10))
+                        continue
+                    skip_provider = True
+                    logger.warning(
+                        f"Provider '{candidate.provider.name}' returned HTTP "
+                        f"{exc.status_code}. Trying the next provider."
+                    )
+                    break
+                except OpenAIError as exc:
+                    last_error = exc
+                    skip_provider = True
+                    logger.warning(
+                        f"Provider '{candidate.provider.name}' failed with "
+                        f"{exc.__class__.__name__}. Trying the next provider."
+                    )
+                    break
+
+            index = (
+                self._next_provider_index(index)
+                if skip_provider
+                else (index + 1) % total
+            )
+
+        if last_error is None:  # pragma: no cover - defensive
+            raise RuntimeError("No LLM candidate could serve the request.")
+        raise last_error
+
+    def _next_provider_index(self, index: int) -> int:
+        """Index of the first candidate that belongs to a different provider."""
+        current = self._candidates[index].provider.name
+        total = len(self._candidates)
+        for offset in range(1, total + 1):
+            candidate_index = (index + offset) % total
+            if self._candidates[candidate_index].provider.name != current:
+                return candidate_index
+        return (index + 1) % total
 
     def _validate_credentials(self) -> None:
         """Raise a clear error instead of an opaque 401 from the provider."""
@@ -349,6 +633,10 @@ class LLM:
                 f"No base_url configured for model '{self.model}'. Set 'base_url' in "
                 "config/config.toml."
             )
+
+    # ------------------------------------------------------------------ #
+    # Token accounting
+    # ------------------------------------------------------------------ #
 
     def count_tokens(self, text: str) -> int:
         """Calculate the number of tokens in a text"""
@@ -386,6 +674,10 @@ class LLM:
             return f"Request may exceed input token limit (Current: {self.total_input_tokens}, Needed: {input_tokens}, Max: {self.max_input_tokens})"
 
         return "Token limit exceeded"
+
+    # ------------------------------------------------------------------ #
+    # Message helpers
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def format_messages(
@@ -475,13 +767,93 @@ class LLM:
 
         return formatted_messages
 
-    @retry(
-        wait=wait_random_exponential(min=1, max=60),
-        stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
-    )
+    def _prepare_messages(
+        self,
+        messages: List[Union[dict, Message]],
+        system_msgs: Optional[List[Union[dict, Message]]],
+        candidate: Optional[Candidate] = None,
+    ) -> List[dict]:
+        """Format the conversation and apply provider specific restrictions.
+
+        ``messages[].name`` is rejected by Groq with a 400 error
+        (https://console.groq.com/docs/openai). The field is optional in the
+        OpenAI specification as long as ``tool_call_id`` is present, so it is
+        removed by default for every provider and can be re-enabled with
+        ``send_message_name = true``.
+        """
+        supports_images = self.supports_images
+        if candidate is not None:
+            configured = getattr(self.llm_config, "supports_images", None)
+            supports_images = (
+                configured
+                if configured is not None
+                else (
+                    candidate.supports_images or model_supports_images(candidate.model)
+                )
+            )
+
+        if system_msgs:
+            formatted_system = self.format_messages(system_msgs, supports_images)
+            formatted = formatted_system + self.format_messages(
+                messages, supports_images
+            )
+        else:
+            formatted = self.format_messages(messages, supports_images)
+
+        if not self.send_message_name:
+            for message in formatted:
+                message.pop("name", None)
+
+        return formatted
+
+    def _build_params(
+        self,
+        candidate: Optional[Candidate],
+        messages: List[dict],
+        temperature=None,
+        **extra,
+    ):
+        """Build the request parameters for a concrete model."""
+        model = candidate.model if candidate is not None else self.model
+        params: Dict = {"model": model, "messages": messages}
+
+        if self.is_reasoning_model:
+            params["max_completion_tokens"] = self.max_tokens
+        else:
+            params["max_tokens"] = self.max_tokens
+            resolved_temperature = (
+                temperature if temperature is not None else self.temperature
+            )
+            # Some models (reasoning models on OpenRouter, certain Gemini
+            # builds) reject the temperature parameter outright.
+            if resolved_temperature is not None:
+                params["temperature"] = resolved_temperature
+
+        params.update(extra)
+        return params
+
+    @staticmethod
+    def _check_finish_reason(response) -> None:
+        """Raise :class:`OutputTruncated` when the model produced no answer."""
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise OutputTruncated("the provider returned no choices")
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+        content = getattr(message, "content", None) if message else None
+        if content:
+            return
+        if finish_reason in ("length", "content_filter", "max_tokens"):
+            raise OutputTruncated(
+                f"the model stopped early (finish_reason={finish_reason})"
+            )
+        raise OutputTruncated("the provider returned an empty message")
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+
     async def ask(
         self,
         messages: List[Union[dict, Message]],
@@ -508,20 +880,12 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            await self._ensure_candidates()
             self._validate_credentials()
 
-            # Check if the model supports images
-            supports_images = self.supports_images
-
-            # Format system and user messages with image support check
-            if system_msgs:
-                system_msgs = self.format_messages(system_msgs, supports_images)
-                messages = system_msgs + self.format_messages(messages, supports_images)
-            else:
-                messages = self.format_messages(messages, supports_images)
-
-            # Calculate input token count
-            input_tokens = self.count_message_tokens(messages)
+            # Calculate input token count on the messages of the active model
+            formatted = self._prepare_messages(messages, system_msgs)
+            input_tokens = self.count_message_tokens(formatted)
 
             # Check if token limits are exceeded
             if not self.check_token_limit(input_tokens):
@@ -529,68 +893,66 @@ class LLM:
                 # Raise a special exception that won't be retried
                 raise TokenLimitExceeded(error_message)
 
-            params = {
-                "model": self.model,
-                "messages": messages,
-            }
-
-            if self.is_reasoning_model:
-                params["max_completion_tokens"] = self.max_tokens
-            else:
-                params["max_tokens"] = self.max_tokens
-                resolved_temperature = (
-                    temperature if temperature is not None else self.temperature
+            def build(candidate: Optional[Candidate]) -> Dict:
+                payload = (
+                    self._prepare_messages(messages, system_msgs, candidate)
+                    if candidate is not None
+                    else formatted
                 )
-                # Some models (e.g. reasoning models on OpenRouter) reject the
-                # temperature parameter entirely; omit it when it is not set.
-                if resolved_temperature is not None:
-                    params["temperature"] = resolved_temperature
+                return self._build_params(candidate, payload, temperature=temperature)
 
             if not stream:
                 # Non-streaming request
-                response = await self.client.chat.completions.create(
-                    **params, stream=False
-                )
+                usage_box: Dict = {}
 
-                if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
+                def consume(response) -> str:
+                    usage_box["usage"] = getattr(response, "usage", None)
+                    self._check_finish_reason(response)
+                    return response.choices[0].message.content
+
+                answer = await self._execute(build, consume, stream=False)
 
                 # Update token counts
-                usage = getattr(response, "usage", None)
+                usage = usage_box.get("usage")
                 if usage is not None:
                     self.update_token_count(
                         getattr(usage, "prompt_tokens", 0) or 0,
                         getattr(usage, "completion_tokens", 0) or 0,
                     )
 
-                return response.choices[0].message.content
+                return answer
 
             # Streaming request, For streaming, update estimated token count before making the request
             self.update_token_count(input_tokens)
 
-            response = await self.client.chat.completions.create(**params, stream=True)
+            async def consume_stream(response) -> str:
+                collected_messages = []
+                completion_text = ""
+                async for chunk in response:
+                    # Some providers (Groq, OpenAI with stream_options) emit a
+                    # final chunk that only carries usage and has an empty
+                    # choices list.
+                    choices = getattr(chunk, "choices", None)
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    chunk_message = (
+                        (getattr(delta, "content", None) or "") if delta else ""
+                    )
+                    collected_messages.append(chunk_message)
+                    completion_text += chunk_message
+                    print(chunk_message, end="", flush=True)
 
-            collected_messages = []
-            completion_text = ""
-            async for chunk in response:
-                # Some providers (Groq, OpenAI with stream_options) emit a final
-                # chunk that only carries usage and has an empty choices list.
-                choices = getattr(chunk, "choices", None)
-                if not choices:
-                    continue
-                delta = getattr(choices[0], "delta", None)
-                chunk_message = (getattr(delta, "content", None) or "") if delta else ""
-                collected_messages.append(chunk_message)
-                completion_text += chunk_message
-                print(chunk_message, end="", flush=True)
+                print()  # Newline after streaming
+                full_response = "".join(collected_messages).strip()
+                if not full_response:
+                    raise OutputTruncated("the model returned an empty stream")
+                return full_response
 
-            print()  # Newline after streaming
-            full_response = "".join(collected_messages).strip()
-            if not full_response:
-                raise ValueError("Empty response from streaming LLM")
+            full_response = await self._execute(build, consume_stream, stream=True)
 
             # estimate completion tokens for streaming response
-            completion_tokens = self.count_tokens(completion_text)
+            completion_tokens = self.count_tokens(full_response)
             logger.info(
                 f"Estimated completion tokens for streaming response: {completion_tokens}"
             )
@@ -617,13 +979,6 @@ class LLM:
             logger.exception(f"Unexpected error in ask")
             raise
 
-    @retry(
-        wait=wait_random_exponential(min=1, max=60),
-        stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
-    )
     async def ask_with_images(
         self,
         messages: List[Union[dict, Message]],
@@ -652,11 +1007,17 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            await self._ensure_candidates()
             self._validate_credentials()
 
             # For ask_with_images, we always set supports_images to True because
-            # this method should only be called with models that support images
-            if not self.supports_images:
+            # this method should only be called with models that support images.
+            # It is enough that *one* candidate of the chain can see images -
+            # the failover may end up on that one.
+            image_capable = self.supports_images or any(
+                candidate.supports_images for candidate in self._candidates
+            )
+            if not image_capable:
                 raise ValueError(
                     f"Model {self.model} does not support images. Set "
                     "supports_images = true in config.toml to force it on, or use a "
@@ -710,65 +1071,67 @@ class LLM:
             else:
                 all_messages = formatted_messages
 
+            if not self.send_message_name:
+                for message in all_messages:
+                    message.pop("name", None)
+
             # Calculate tokens and check limits
             input_tokens = self.count_message_tokens(all_messages)
             if not self.check_token_limit(input_tokens):
                 raise TokenLimitExceeded(self.get_limit_error_message(input_tokens))
 
-            # Set up API parameters
-            params = {
-                "model": self.model,
-                "messages": all_messages,
-                "stream": stream,
-            }
-
-            # Add model-specific parameters
-            if self.is_reasoning_model:
-                params["max_completion_tokens"] = self.max_tokens
-            else:
-                params["max_tokens"] = self.max_tokens
-                resolved_temperature = (
-                    temperature if temperature is not None else self.temperature
+            def build(candidate: Optional[Candidate]) -> Dict:
+                return self._build_params(
+                    candidate,
+                    all_messages,
+                    temperature=temperature,
+                    stream=stream,
                 )
-                # Some models (reasoning models on OpenRouter, certain Gemini
-                # builds) reject the temperature parameter outright.
-                if resolved_temperature is not None:
-                    params["temperature"] = resolved_temperature
 
             # Handle non-streaming request
             if not stream:
-                response = await self.client.chat.completions.create(**params)
+                usage_box: Dict = {}
 
-                if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
+                def consume(response) -> str:
+                    usage_box["usage"] = getattr(response, "usage", None)
+                    self._check_finish_reason(response)
+                    return response.choices[0].message.content
 
-                usage = getattr(response, "usage", None)
+                answer = await self._execute(build, consume)
+
+                usage = usage_box.get("usage")
                 if usage is not None:
                     self.update_token_count(getattr(usage, "prompt_tokens", 0) or 0)
-                return response.choices[0].message.content
+                return answer
 
             # Handle streaming request
             self.update_token_count(input_tokens)
-            response = await self.client.chat.completions.create(**params)
 
-            collected_messages = []
-            async for chunk in response:
-                # Providers may emit a trailing chunk that only carries usage.
-                choices = getattr(chunk, "choices", None)
-                if not choices:
-                    continue
-                delta = getattr(choices[0], "delta", None)
-                chunk_message = (getattr(delta, "content", None) or "") if delta else ""
-                collected_messages.append(chunk_message)
-                print(chunk_message, end="", flush=True)
+            async def consume_stream(response) -> str:
+                collected_messages = []
+                completion_text = ""
+                async for chunk in response:
+                    # Providers may emit a trailing chunk that only carries usage.
+                    choices = getattr(chunk, "choices", None)
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    chunk_message = (
+                        (getattr(delta, "content", None) or "") if delta else ""
+                    )
+                    collected_messages.append(chunk_message)
+                    completion_text += chunk_message
+                    print(chunk_message, end="", flush=True)
 
-            print()  # Newline after streaming
-            full_response = "".join(collected_messages).strip()
+                print()  # Newline after streaming
+                full_response = "".join(collected_messages).strip()
 
-            if not full_response:
-                raise ValueError("Empty response from streaming LLM")
+                if not full_response:
+                    raise OutputTruncated("the model returned an empty stream")
 
-            return full_response
+                return full_response
+
+            return await self._execute(build, consume_stream)
 
         except TokenLimitExceeded:
             raise
@@ -788,13 +1151,6 @@ class LLM:
             logger.error(f"Unexpected error in ask_with_images: {e}")
             raise
 
-    @retry(
-        wait=wait_random_exponential(min=1, max=60),
-        stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
-    )
     async def ask_tool(
         self,
         messages: List[Union[dict, Message]],
@@ -827,24 +1183,17 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            await self._ensure_candidates()
             self._validate_credentials()
 
             # Validate tool_choice
             if tool_choice not in TOOL_CHOICE_VALUES:
                 raise ValueError(f"Invalid tool_choice: {tool_choice}")
 
-            # Check if the model supports images
-            supports_images = self.supports_images
-
-            # Format messages
-            if system_msgs:
-                system_msgs = self.format_messages(system_msgs, supports_images)
-                messages = system_msgs + self.format_messages(messages, supports_images)
-            else:
-                messages = self.format_messages(messages, supports_images)
+            formatted = self._prepare_messages(messages, system_msgs)
 
             # Calculate input token count
-            input_tokens = self.count_message_tokens(messages)
+            input_tokens = self.count_message_tokens(formatted)
 
             # If there are tools, calculate token count for tool descriptions
             tools_tokens = 0
@@ -866,46 +1215,51 @@ class LLM:
                     if not isinstance(tool, dict) or "type" not in tool:
                         raise ValueError("Each tool must be a dict with 'type' field")
 
-            # Set up the completion request
-            params = {
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": tool_choice,
-                "timeout": timeout,
-                **kwargs,
-            }
-
-            if self.is_reasoning_model:
-                params["max_completion_tokens"] = self.max_tokens
-            else:
-                params["max_tokens"] = self.max_tokens
-                resolved_temperature = (
-                    temperature if temperature is not None else self.temperature
+            def build(candidate: Optional[Candidate]) -> Dict:
+                payload = (
+                    self._prepare_messages(messages, system_msgs, candidate)
+                    if candidate is not None
+                    else formatted
                 )
-                if resolved_temperature is not None:
-                    params["temperature"] = resolved_temperature
+                params = self._build_params(candidate, payload, temperature=temperature)
+                params["tools"] = tools
+                params["tool_choice"] = tool_choice
+                params["timeout"] = timeout
+                params.update(kwargs)
+                # Always use non-streaming for tool requests
+                params["stream"] = False
+                return params
 
-            params["stream"] = False  # Always use non-streaming for tool requests
-            response: ChatCompletion = await self.client.chat.completions.create(
-                **params
-            )
+            usage_box: Dict = {}
 
-            # Check if response is valid
-            if not response.choices or not response.choices[0].message:
-                print(response)
-                # raise ValueError("Invalid or empty response from LLM")
+            def consume(response) -> ChatCompletionMessage:
+                usage_box["usage"] = getattr(response, "usage", None)
+                if not response.choices or not response.choices[0].message:
+                    print(response)
+                    return None
+                message = response.choices[0].message
+                # A model that only returns a tool call is fine; an empty
+                # answer without any tool call is not.
+                if not (getattr(message, "content", None) or message.tool_calls):
+                    raise OutputTruncated(
+                        "the model returned neither content nor a tool call"
+                    )
+                return message
+
+            response = await self._execute(build, consume)
+
+            if response is None:
                 return None
 
             # Update token counts
-            usage = getattr(response, "usage", None)
+            usage = usage_box.get("usage")
             if usage is not None:
                 self.update_token_count(
                     getattr(usage, "prompt_tokens", 0) or 0,
                     getattr(usage, "completion_tokens", 0) or 0,
                 )
 
-            return response.choices[0].message
+            return response
 
         except TokenLimitExceeded:
             # Re-raise token limit errors without logging

@@ -8,6 +8,8 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from app.providers import BUILTIN_PROVIDERS, infer_family
+
 
 def get_project_root() -> Path:
     """Get the project root directory"""
@@ -41,6 +43,35 @@ def expand_env_vars(value):
     return value
 
 
+class ProviderSettings(BaseModel):
+    """One OpenAI-compatible provider that the agent may talk to."""
+
+    name: str = Field(..., description="Provider name, e.g. 'groq'")
+    base_url: str = Field("", description="API base URL (empty -> provider default)")
+    api_key: str = Field("", description="API key (empty -> resolved from env)")
+    model: str = Field(
+        "auto",
+        description=(
+            "Model id. 'auto' discovers the currently available free models "
+            "from the provider's own /models endpoint."
+        ),
+    )
+    prefer: List[str] = Field(
+        default_factory=list,
+        description="Model ids to try first, in order (optional hint).",
+    )
+    free_only: bool = Field(True, description="Only use models that are free to call.")
+    max_candidates: int = Field(
+        3, description="How many models of this provider to keep as fallbacks."
+    )
+    extra_headers: Optional[Dict[str, str]] = Field(
+        None, description="Additional HTTP headers sent with every request."
+    )
+    family: str = Field(
+        "", description="Provider family (groq/gemini/openrouter/generic)."
+    )
+
+
 class LLMSettings(BaseModel):
     model: str = Field(..., description="Model name")
     base_url: str = Field("", description="API base URL")
@@ -69,6 +100,23 @@ class LLMSettings(BaseModel):
     extra_headers: Optional[Dict[str, str]] = Field(
         None,
         description="Additional HTTP headers sent with every request (e.g. OpenRouter attribution).",
+    )
+    providers: List[ProviderSettings] = Field(
+        default_factory=list,
+        description=(
+            "Ordered provider chain. The agent rotates to the next provider "
+            "whenever the current one fails."
+        ),
+    )
+    send_message_name: bool = Field(
+        False,
+        description=(
+            "Send messages[].name. Groq rejects that field with a 400 error, "
+            "so it is disabled by default."
+        ),
+    )
+    max_retries: int = Field(
+        2, description="Retries per candidate before rotating to the next one."
     )
 
 
@@ -299,6 +347,87 @@ class Config:
             profile["api_key"] = os.environ.get("OPENMANUS_API_KEY", "")
         return profile
 
+    @staticmethod
+    def _build_provider(name: str, overrides: dict) -> dict:
+        """Resolve one provider from the ``[providers.<name>]`` table."""
+        defaults = BUILTIN_PROVIDERS.get(name)
+        overrides = overrides or {}
+
+        base_url = overrides.get("base_url") or (defaults.base_url if defaults else "")
+        api_key = overrides.get("api_key") or ""
+
+        if not api_key and defaults:
+            for env_name in defaults.api_key_env:
+                api_key = os.environ.get(env_name, "")
+                if api_key:
+                    break
+
+        extra_headers = overrides.get("extra_headers")
+        if extra_headers is None and defaults:
+            extra_headers = dict(defaults.default_headers) or None
+
+        return {
+            "name": name,
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": overrides.get("model", "auto"),
+            "prefer": list(overrides.get("prefer", []) or []),
+            "free_only": bool(overrides.get("free_only", True)),
+            "max_candidates": int(overrides.get("max_candidates", 3)),
+            "extra_headers": extra_headers,
+            # The family is derived from the provider name so that a custom
+            # base URL (proxy, gateway, mock) keeps the provider specific
+            # catalogue rules.
+            "family": overrides.get("family") or infer_family(base_url, name),
+        }
+
+    @classmethod
+    def _resolve_providers(cls, profile: dict, provider_tables: dict) -> list:
+        """Build the ordered provider chain of an LLM profile.
+
+        Three modes are supported:
+
+        1. ``providers = ["groq", "gemini"]`` - an explicit fallback chain.
+        2. ``model``/``base_url`` set to a concrete model - the legacy single
+           provider mode.
+        3. ``model = "auto"`` - every built-in provider whose API key is
+           available in the environment is used, in the order they are declared.
+        """
+        names = profile.get("providers") or []
+        chain = []
+
+        if names:
+            for name in names:
+                chain.append(cls._build_provider(name, provider_tables.get(name, {})))
+        else:
+            model = profile.get("model")
+            base_url = profile.get("base_url")
+            if model and model != "auto" and base_url and base_url != "auto":
+                chain.append(
+                    {
+                        "name": "default",
+                        "base_url": base_url,
+                        "api_key": profile.get("api_key", ""),
+                        "model": model,
+                        "prefer": list(profile.get("prefer", []) or []),
+                        "free_only": bool(profile.get("free_only", True)),
+                        "max_candidates": int(profile.get("max_candidates", 3)),
+                        "extra_headers": profile.get("extra_headers"),
+                        "family": infer_family(base_url, "default"),
+                    }
+                )
+            else:
+                for name in BUILTIN_PROVIDERS:
+                    chain.append(
+                        cls._build_provider(name, provider_tables.get(name, {}))
+                    )
+
+        # A global key only makes sense when a single provider is configured.
+        if len(chain) == 1 and not chain[0]["api_key"]:
+            chain[0]["api_key"] = os.environ.get("OPENMANUS_API_KEY", "")
+
+        return chain
+
     def _load_initial_config(self):
         raw_config = expand_env_vars(self._load_config())
         base_llm = raw_config.get("llm", {})
@@ -328,6 +457,10 @@ class Config:
             "api_version": base_llm.get("api_version", ""),
             "supports_images": base_llm.get("supports_images"),
             "extra_headers": shared_llm_settings.get("extra_headers"),
+            # An explicit provider chain, e.g. providers = ["groq", "gemini"].
+            # When it is missing, "auto" mode builds the chain from every
+            # built-in provider whose API key is available.
+            "providers": base_llm.get("providers", []) or [],
         }
 
         # handle browser config.
@@ -392,13 +525,20 @@ class Config:
             run_flow_settings = RunflowSettings(**run_flow_config)
         else:
             run_flow_settings = RunflowSettings()
+        provider_tables = raw_config.get("providers", {}) or {}
+        if not isinstance(provider_tables, dict):
+            provider_tables = {}
+
+        def _build_profile(base: dict, override: dict) -> dict:
+            profile = self._finalize_llm_profile({**base, **override})
+            profile["providers"] = self._resolve_providers(profile, provider_tables)
+            return profile
+
         config_dict = {
             "llm": {
-                "default": default_settings,
+                "default": _build_profile(default_settings, {}),
                 **{
-                    name: self._finalize_llm_profile(
-                        {**default_settings, **override_config}
-                    )
+                    name: _build_profile(default_settings, override_config)
                     for name, override_config in llm_overrides.items()
                 },
             },

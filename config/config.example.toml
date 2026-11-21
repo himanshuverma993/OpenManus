@@ -15,6 +15,35 @@ temperature = 0.0                          # Controls randomness
 #
 # supports_images = true / false forces image input support on or off instead
 # of auto-detecting it from the model name.
+#
+# ---------------------------------------------------------------------------
+# AUTOMATIC MODE (recommended for free providers)
+# ---------------------------------------------------------------------------
+# model = "auto" makes OpenManus discover the models that are available right
+# now from the provider's own /models endpoint. No model name has to be
+# maintained and a retired or rate limited model is skipped automatically.
+#
+# providers = [...] defines the fallback chain. When the current provider
+# fails (invalid key, rate limit, outage, incompatible request) the next one
+# takes over, so a single working key is enough:
+#
+#   [llm]
+#   model = "auto"
+#   providers = ["groq", "gemini", "openrouter"]
+#   max_tokens = 8192
+#
+#   [providers.groq]
+#   api_key = "${GROQ_API_KEY}"
+#   max_candidates = 3
+#   free_only = true
+#
+#   [providers.gemini]
+#   api_key = "${GEMINI_API_KEY}"
+#
+#   [providers.openrouter]
+#   api_key = "${OPENROUTER_API_KEY}"
+#
+# See config.example-kaggle.toml for a complete free-tier setup.
 
 # [llm] # Amazon Bedrock
 # api_type = "aws"                                       # Required
