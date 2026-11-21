@@ -1,5 +1,7 @@
 import sys
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 from loguru import logger as _logger
 
@@ -7,6 +9,25 @@ from app.config import PROJECT_ROOT
 
 
 _print_level = "INFO"
+
+
+def _log_file_path(log_name: str):
+    """Return a writable log file path, falling back to the temp directory.
+
+    The project directory can be read-only (e.g. a mounted dataset on Kaggle or
+    a system package directory). Loguru raises at import time when it cannot
+    create its file sink, which would take down the whole application.
+    """
+    preferred = PROJECT_ROOT / "logs" / f"{log_name}.log"
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        with open(preferred, "a"):
+            pass
+        return preferred
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / "openmanus-logs" / f"{log_name}.log"
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 def define_log_level(print_level="INFO", logfile_level="DEBUG", name: str = None):
@@ -22,7 +43,11 @@ def define_log_level(print_level="INFO", logfile_level="DEBUG", name: str = None
 
     _logger.remove()
     _logger.add(sys.stderr, level=print_level)
-    _logger.add(PROJECT_ROOT / f"logs/{log_name}.log", level=logfile_level)
+    try:
+        _logger.add(_log_file_path(log_name), level=logfile_level)
+    except OSError:
+        # Never let logging setup break the application.
+        pass
     return _logger
 
 

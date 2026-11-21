@@ -1,0 +1,31 @@
+# Slim dependency set for running OpenManus on Kaggle / Colab / CPU-only boxes.
+#
+# It only contains what the core agent (Manus) actually needs at import and
+# run time. The heavyweight extras in `requirements.txt` (playwright,
+# browsergym, crawl4ai, datasets, gymnasium, docker, boto3, pandas, pillow)
+# are only used by optional features such as the browser agent, the Daytona
+# sandbox, the Bedrock provider or the data-analysis agent, and are therefore
+# left out here.
+#
+# Install with:
+#     pip install -r requirements-kaggle.txt
+
+# --- core ---
+pydantic~=2.10.6
+openai~=1.66.3
+tenacity~=9.0.0
+tiktoken~=0.9.0
+loguru~=0.7.3
+structlog>=24.1.0,<26.0.0
+requests~=2.32.3
+beautifulsoup4~=4.13.3
+httpx>=0.27.0
+tomli>=2.0.0
+
+# --- MCP client (used by the Manus agent to discover MCP tools) ---
+mcp~=1.5.0
+
+# --- web search engines (imported by app.tool.web_search) ---
+googlesearch-python~=1.3.0
+baidusearch~=1.0.3
+duckduckgo_search~=7.5.3

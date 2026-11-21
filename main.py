@@ -3,6 +3,7 @@ import asyncio
 
 from app.agent.manus import Manus
 from app.logger import logger
+from app.utils.prompt import resolve_prompt
 
 
 async def main():
@@ -13,18 +14,24 @@ async def main():
     )
     args = parser.parse_args()
 
+    prompt = resolve_prompt(args.prompt)
+    if not prompt:
+        logger.error(
+            'No prompt supplied. Use `--prompt "your task"`, set the '
+            "OPENMANUS_PROMPT environment variable, or call "
+            '`await agent.run("your task")` directly from a notebook.'
+        )
+        return
+
     # Create and initialize Manus agent
     agent = await Manus.create()
     try:
-        # Use command line prompt if provided, otherwise ask for input
-        prompt = args.prompt if args.prompt else input("Enter your prompt: ")
-        if not prompt.strip():
-            logger.warning("Empty prompt provided.")
-            return
-
         logger.warning("Processing your request...")
-        await agent.run(prompt)
+        result = await agent.run(prompt)
         logger.info("Request processing completed.")
+        # Print the final answer to stdout so it is visible in notebooks and CI logs.
+        print("\n=== FINAL RESULT ===")
+        print(result)
     except KeyboardInterrupt:
         logger.warning("Operation interrupted.")
     finally:

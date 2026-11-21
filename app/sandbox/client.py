@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from typing import Dict, Optional, Protocol
 
 from app.config import SandboxSettings
-from app.sandbox.core.sandbox import DockerSandbox
 
 
 class SandboxFileOperations(Protocol):
@@ -104,6 +103,10 @@ class LocalSandboxClient(BaseSandboxClient):
         Raises:
             RuntimeError: If sandbox creation fails.
         """
+        # Imported lazily so the `docker` SDK is only required when the sandbox
+        # is actually used (it is not needed for a plain text/tool-calling agent).
+        from app.sandbox.core.sandbox import DockerSandbox
+
         self.sandbox = DockerSandbox(config, volume_bindings)
         await self.sandbox.create()
 

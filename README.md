@@ -158,6 +158,14 @@ python main.py
 
 Then input your idea via terminal!
 
+You can also pass the prompt directly (useful in notebooks / CI):
+
+```bash
+python main.py --prompt "Summarize the README.md in this repository"
+# or
+OPENMANUS_PROMPT="Summarize the README.md" python main.py
+```
+
 For MCP tool version, you can run:
 ```bash
 python run_mcp.py
@@ -169,6 +177,95 @@ For unstable multi-agent version, you also can run:
 python run_flow.py
 ```
 
+## Running on Kaggle (free LLM APIs)
+
+OpenManus talks to every provider through the OpenAI-compatible Chat Completions
+API, so Groq, Google Gemini and OpenRouter all work by only changing
+`base_url` and `model` in `config/config.toml` - no code changes required.
+
+Ready-to-use notebook: **`notebooks/OpenManus_Kaggle.ipynb`**
+
+```bash
+pip install -r requirements-kaggle.txt
+```
+
+`requirements-kaggle.txt` is a slim dependency set that contains only what the
+core agent needs (it skips `playwright`, `browsergym`, `crawl4ai`, `docker`,
+`boto3`, `pandas`, `pillow`, ...).
+
+### Provider configuration
+
+Copy the example that matches your provider and export the key:
+
+```bash
+cp config/config.example-model-groq.toml       config/config.toml   # Groq
+cp config/config.example-model-gemini.toml     config/config.toml   # Gemini
+cp config/config.example-model-openrouter.toml config/config.toml   # OpenRouter
+
+export GROQ_API_KEY="gsk_..."       # or GEMINI_API_KEY / OPENROUTER_API_KEY
+```
+
+| Provider | `base_url` | Suggested free model |
+|---|---|---|
+| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` (or `llama-3.1-8b-instant` for a bigger daily budget) |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `google/gemini-2.5-flash:free` (only ~50 requests/day on the free tier) |
+
+### Keeping secrets out of the config file
+
+Any string in `config/config.toml` may contain an environment placeholder:
+
+```toml
+[llm]
+model = "llama-3.3-70b-versatile"
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY}"      # resolved from the environment at load time
+max_tokens = 8192
+temperature = 0.0
+```
+
+`${VAR}` and `${VAR:-fallback}` are supported. If `api_key` is omitted entirely,
+the `OPENMANUS_API_KEY` environment variable is used.
+
+### Useful per-model options
+
+| Option | Meaning |
+|---|---|
+| `supports_images = true/false` | Force image input support on or off instead of auto-detecting it from the model name (Gemini and Groq's `llama-4-scout` are detected automatically). |
+| `temperature = "none"` | Leave the `temperature` parameter out of the request entirely - required by some reasoning models. |
+| `max_input_tokens = 50000` | Hard cap on the total input tokens used across a whole run. |
+| `max_tokens` | Output-token cap. Keep it below the provider's limit (e.g. Groq's `llama-4-scout` allows 8 192). |
+| `[llm.extra_headers]` | Extra HTTP headers for every request, e.g. OpenRouter's `HTTP-Referer` / `X-Title`. |
+
+Named profiles let you switch models without editing the file, e.g.
+
+```toml
+[llm]
+model = "llama-3.3-70b-versatile"
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY}"
+
+[llm.fast]
+model = "llama-3.1-8b-instant"
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY}"
+```
+
+```python
+from app.llm import LLM
+
+llm = LLM(config_name="fast")
+```
+
+### Notebook tips
+
+* `OPENMANUS_DISABLE_BROWSER_USE=1` disables the Browser Use MCP server. It needs a
+  local Chromium and `uvx`, neither of which exist on Kaggle.
+* `ask_human` cannot ask a question in a notebook (there is no interactive stdin);
+  the tool now reports that instead of crashing, and the agent continues on its own.
+* `tiktoken` downloads its BPE tables from `openaipublic.blob.core.windows.net` on
+  first use. If that host is blocked, OpenManus falls back to an approximate
+  tokenizer instead of failing to start.
 ### Custom Adding Multiple Agents
 
 Currently, besides the general OpenManus Agent, we have also integrated the DataAnalysis Agent, which is suitable for data analysis and data visualization tasks. You can add this agent to `run_flow` in `config.toml`.

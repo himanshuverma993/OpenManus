@@ -1,0 +1,37 @@
+# OpenManus configuration for Groq (free tier, OpenAI-compatible API)
+#
+# Copy to config/config.toml and fill in your key:
+#     cp config/config.example-model-groq.toml config/config.toml
+#
+# The `${GROQ_API_KEY}` placeholder is resolved from the environment at runtime,
+# so you never have to commit a real key. Export it before starting:
+#     export GROQ_API_KEY="gsk_..."
+#
+[llm]
+model = "llama-3.3-70b-versatile"           # Free tier: llama-3.3-70b-versatile,
+base_url = "https://api.groq.com/openai/v1"   # llama-3.1-8b-instant,
+api_key = "${GROQ_API_KEY}"                  # meta-llama/llama-4-scout-17b-16e-instruct,
+max_tokens = 8192                            # openai/gpt-oss-120b
+temperature = 0.0
+# max_input_tokens = 100000                 # optional hard cap across the run
+
+# Optional: a second profile so you can switch models without editing the file.
+# Named profiles are selected with LLM(config_name="<name>").
+[llm.fast]
+model = "llama-3.1-8b-instant"
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY}"
+max_tokens = 4096
+temperature = 0.0
+
+# Optional: a vision capable profile (llama-4-scout supports image input).
+[llm.vision]
+model = "meta-llama/llama-4-scout-17b-16e-instruct"
+base_url = "https://api.groq.com/openai/v1"
+api_key = "${GROQ_API_KEY}"
+max_tokens = 4096
+temperature = 0.0
+
+# Optional: MCP servers. Leave empty to run without MCP.
+[mcp]
+server_reference = "app.mcp.server"

@@ -1,0 +1,35 @@
+# OpenManus configuration for Google Gemini (free tier, OpenAI-compatible API)
+#
+# Copy to config/config.toml and fill in your key:
+#     cp config/config.example-model-gemini.toml config/config.toml
+#
+#     export GEMINI_API_KEY="AIza..."
+#
+[llm]
+model = "gemini-2.5-flash"                                              # Free tier
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"   # OpenAI-compat endpoint
+api_key = "${GEMINI_API_KEY}"
+max_tokens = 8192
+temperature = 0.0
+# Every Gemini model accepts image input, so vision works out of the box.
+supports_images = true
+
+# Optional: a second profile with a different Gemini model.
+[llm.pro]
+model = "gemini-2.5-pro"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+api_key = "${GEMINI_API_KEY}"
+max_tokens = 8192
+temperature = 0.0
+
+# Optional: a vision profile.
+[llm.vision]
+model = "gemini-2.5-flash"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+api_key = "${GEMINI_API_KEY}"
+max_tokens = 8192
+temperature = 0.0
+
+# Optional: MCP servers. Leave empty to run without MCP.
+[mcp]
+server_reference = "app.mcp.server"

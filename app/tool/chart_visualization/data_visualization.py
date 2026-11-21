@@ -138,8 +138,12 @@ Outputs:
                     }
                 )
         if len(error_list) > 0:
+            # The join is computed outside the f-string expression on purpose:
+            # backslashes inside f-string expressions are only allowed from
+            # Python 3.12 onwards (PEP 701).
+            error_summary = "\n".join(error_list)
             return {
-                "observation": f"# Error chart generated{'\n'.join(error_list)}\n{self.success_output_template(success_list)}",
+                "observation": f"# Error chart generated{error_summary}\n{self.success_output_template(success_list)}",
                 "success": False,
             }
         else:
@@ -186,8 +190,11 @@ Outputs:
             else ""
         )
         if len(error_list) > 0:
+            # Computed outside the f-string expression: backslashes inside
+            # f-string expressions are only allowed from Python 3.12 (PEP 701).
+            error_summary = "\n".join(error_list)
             return {
-                "observation": f"# Error in chart insights:{'\n'.join(error_list)}\n{success_template}",
+                "observation": f"# Error in chart insights:{error_summary}\n{success_template}",
                 "success": False,
             }
         else:

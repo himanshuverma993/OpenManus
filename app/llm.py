@@ -18,7 +18,6 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from app.bedrock import BedrockClient
 from app.config import LLMSettings, config
 from app.exceptions import TokenLimitExceeded
 from app.logger import logger  # Assuming a logger is set up in your app
@@ -31,7 +30,15 @@ from app.schema import (
 )
 
 
-REASONING_MODELS = ["o1", "o3-mini"]
+REASONING_MODELS = [
+    "o1",
+    "o1-mini",
+    "o1-preview",
+    "o1-pro",
+    "o3",
+    "o3-mini",
+    "o4-mini",
+]
 MULTIMODAL_MODELS = [
     "gpt-4-vision-preview",
     "gpt-4o",
@@ -40,6 +47,97 @@ MULTIMODAL_MODELS = [
     "claude-3-sonnet-20240229",
     "claude-3-haiku-20240307",
 ]
+
+# Model-name prefixes that identify multimodal (image-capable) models. This keeps
+# vision support working for third-party OpenAI-compatible providers such as
+# Google Gemini, Groq (llama-4-scout) and OpenRouter, where the model id does
+# not match the upstream OpenAI/Anthropic ids.
+MULTIMODAL_MODEL_PREFIXES = (
+    "gemini-",  # every Gemini model accepts image input
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-5",
+    "claude-3",
+    "claude-4",
+    "llama-4-scout",
+    "llama-4-maverick",
+    "qwen2.5-vl",
+    "qwen3-vl",
+    "internvl",
+    "pixtral",
+    "llava",
+)
+
+
+def normalize_model_id(model: str) -> str:
+    """Strip provider routing prefixes (e.g. OpenRouter's ``openai/o3-mini``)."""
+    if not model:
+        return ""
+    return model.split("/")[-1].strip().lower()
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Return True when the model uses the ``max_completion_tokens`` parameter."""
+    normalized = normalize_model_id(model)
+    if not normalized:
+        return False
+    return any(
+        normalized == candidate or normalized.startswith(candidate)
+        for candidate in REASONING_MODELS
+    )
+
+
+def model_supports_images(model: str) -> bool:
+    """Best-effort detection of image (multimodal) input support."""
+    normalized = normalize_model_id(model)
+    if not normalized:
+        return False
+    if normalized in MULTIMODAL_MODELS:
+        return True
+    return any(normalized.startswith(prefix) for prefix in MULTIMODAL_MODEL_PREFIXES)
+
+
+class ApproximateTokenizer:
+    """Offline fallback tokenizer.
+
+    ``tiktoken`` downloads its BPE tables from ``openaipublic.blob.core.windows.net``
+    on first use. When that host is unreachable (restricted egress, offline
+    notebooks, air-gapped CI) the download raises and the agent cannot start.
+    This tokenizer approximates the OpenAI rule of thumb of ~4 characters per
+    token so that token accounting keeps working without network access.
+    """
+
+    CHARS_PER_TOKEN = 4
+
+    def encode(self, text: str) -> List[int]:
+        if not text:
+            return []
+        return [0] * max(
+            1, (len(text) + self.CHARS_PER_TOKEN - 1) // self.CHARS_PER_TOKEN
+        )
+
+    def decode(self, tokens: List[int]) -> str:
+        return ""
+
+
+def load_tokenizer(model: str):
+    """Build a tokenizer, degrading gracefully when tiktoken data is unavailable."""
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception:  # unknown model id
+        pass
+
+    for encoding_name in ("cl100k_base", "o200k_base"):
+        try:
+            return tiktoken.get_encoding(encoding_name)
+        except Exception:  # download failed / blocked
+            continue
+
+    logger.warning(
+        "Unable to load a tiktoken encoding (offline or blocked download). "
+        "Falling back to an approximate tokenizer; token counts will be rough."
+    )
+    return ApproximateTokenizer()
 
 
 class TokenCounter:
@@ -196,6 +294,17 @@ class LLM:
             self.api_key = llm_config.api_key
             self.api_version = llm_config.api_version
             self.base_url = llm_config.base_url
+            self.extra_headers = llm_config.extra_headers
+            self.is_reasoning_model = is_reasoning_model(self.model)
+
+            # Image support can be forced on/off from the config file; when it is
+            # not set we infer it from the model name.
+            configured_image_support = getattr(llm_config, "supports_images", None)
+            self.supports_images = (
+                configured_image_support
+                if configured_image_support is not None
+                else model_supports_images(self.model)
+            )
 
             # Add token counting related attributes
             self.total_input_tokens = 0
@@ -206,12 +315,8 @@ class LLM:
                 else None
             )
 
-            # Initialize tokenizer
-            try:
-                self.tokenizer = tiktoken.encoding_for_model(self.model)
-            except KeyError:
-                # If the model is not in tiktoken's presets, use cl100k_base as default
-                self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            # Initialize tokenizer (falls back to an offline approximation)
+            self.tokenizer = load_tokenizer(self.model)
 
             if self.api_type == "azure":
                 self.client = AsyncAzureOpenAI(
@@ -220,11 +325,30 @@ class LLM:
                     api_version=self.api_version,
                 )
             elif self.api_type == "aws":
+                # Imported lazily so boto3 is only required for Bedrock users.
+                from app.bedrock import BedrockClient
+
                 self.client = BedrockClient()
             else:
-                self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+                client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
+                if self.extra_headers:
+                    client_kwargs["default_headers"] = self.extra_headers
+                self.client = AsyncOpenAI(**client_kwargs)
 
             self.token_counter = TokenCounter(self.tokenizer)
+
+    def _validate_credentials(self) -> None:
+        """Raise a clear error instead of an opaque 401 from the provider."""
+        if not self.api_key:
+            raise ValueError(
+                f"No API key configured for model '{self.model}'. Set 'api_key' in "
+                "config/config.toml (or use a ${ENV_VAR} placeholder / OPENMANUS_API_KEY)."
+            )
+        if not self.base_url:
+            raise ValueError(
+                f"No base_url configured for model '{self.model}'. Set 'base_url' in "
+                "config/config.toml."
+            )
 
     def count_tokens(self, text: str) -> int:
         """Calculate the number of tokens in a text"""
@@ -384,8 +508,10 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            self._validate_credentials()
+
             # Check if the model supports images
-            supports_images = self.model in MULTIMODAL_MODELS
+            supports_images = self.supports_images
 
             # Format system and user messages with image support check
             if system_msgs:
@@ -408,13 +534,17 @@ class LLM:
                 "messages": messages,
             }
 
-            if self.model in REASONING_MODELS:
+            if self.is_reasoning_model:
                 params["max_completion_tokens"] = self.max_tokens
             else:
                 params["max_tokens"] = self.max_tokens
-                params["temperature"] = (
+                resolved_temperature = (
                     temperature if temperature is not None else self.temperature
                 )
+                # Some models (e.g. reasoning models on OpenRouter) reject the
+                # temperature parameter entirely; omit it when it is not set.
+                if resolved_temperature is not None:
+                    params["temperature"] = resolved_temperature
 
             if not stream:
                 # Non-streaming request
@@ -426,9 +556,12 @@ class LLM:
                     raise ValueError("Empty or invalid response from LLM")
 
                 # Update token counts
-                self.update_token_count(
-                    response.usage.prompt_tokens, response.usage.completion_tokens
-                )
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    self.update_token_count(
+                        getattr(usage, "prompt_tokens", 0) or 0,
+                        getattr(usage, "completion_tokens", 0) or 0,
+                    )
 
                 return response.choices[0].message.content
 
@@ -440,7 +573,13 @@ class LLM:
             collected_messages = []
             completion_text = ""
             async for chunk in response:
-                chunk_message = chunk.choices[0].delta.content or ""
+                # Some providers (Groq, OpenAI with stream_options) emit a final
+                # chunk that only carries usage and has an empty choices list.
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                chunk_message = (getattr(delta, "content", None) or "") if delta else ""
                 collected_messages.append(chunk_message)
                 completion_text += chunk_message
                 print(chunk_message, end="", flush=True)
@@ -513,11 +652,15 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            self._validate_credentials()
+
             # For ask_with_images, we always set supports_images to True because
             # this method should only be called with models that support images
-            if self.model not in MULTIMODAL_MODELS:
+            if not self.supports_images:
                 raise ValueError(
-                    f"Model {self.model} does not support images. Use a model from {MULTIMODAL_MODELS}"
+                    f"Model {self.model} does not support images. Set "
+                    "supports_images = true in config.toml to force it on, or use a "
+                    "vision capable model."
                 )
 
             # Format messages with image support
@@ -580,13 +723,17 @@ class LLM:
             }
 
             # Add model-specific parameters
-            if self.model in REASONING_MODELS:
+            if self.is_reasoning_model:
                 params["max_completion_tokens"] = self.max_tokens
             else:
                 params["max_tokens"] = self.max_tokens
-                params["temperature"] = (
+                resolved_temperature = (
                     temperature if temperature is not None else self.temperature
                 )
+                # Some models (reasoning models on OpenRouter, certain Gemini
+                # builds) reject the temperature parameter outright.
+                if resolved_temperature is not None:
+                    params["temperature"] = resolved_temperature
 
             # Handle non-streaming request
             if not stream:
@@ -595,7 +742,9 @@ class LLM:
                 if not response.choices or not response.choices[0].message.content:
                     raise ValueError("Empty or invalid response from LLM")
 
-                self.update_token_count(response.usage.prompt_tokens)
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    self.update_token_count(getattr(usage, "prompt_tokens", 0) or 0)
                 return response.choices[0].message.content
 
             # Handle streaming request
@@ -604,7 +753,12 @@ class LLM:
 
             collected_messages = []
             async for chunk in response:
-                chunk_message = chunk.choices[0].delta.content or ""
+                # Providers may emit a trailing chunk that only carries usage.
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                chunk_message = (getattr(delta, "content", None) or "") if delta else ""
                 collected_messages.append(chunk_message)
                 print(chunk_message, end="", flush=True)
 
@@ -673,12 +827,14 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
+            self._validate_credentials()
+
             # Validate tool_choice
             if tool_choice not in TOOL_CHOICE_VALUES:
                 raise ValueError(f"Invalid tool_choice: {tool_choice}")
 
             # Check if the model supports images
-            supports_images = self.model in MULTIMODAL_MODELS
+            supports_images = self.supports_images
 
             # Format messages
             if system_msgs:
@@ -720,13 +876,15 @@ class LLM:
                 **kwargs,
             }
 
-            if self.model in REASONING_MODELS:
+            if self.is_reasoning_model:
                 params["max_completion_tokens"] = self.max_tokens
             else:
                 params["max_tokens"] = self.max_tokens
-                params["temperature"] = (
+                resolved_temperature = (
                     temperature if temperature is not None else self.temperature
                 )
+                if resolved_temperature is not None:
+                    params["temperature"] = resolved_temperature
 
             params["stream"] = False  # Always use non-streaming for tool requests
             response: ChatCompletion = await self.client.chat.completions.create(
@@ -740,9 +898,12 @@ class LLM:
                 return None
 
             # Update token counts
-            self.update_token_count(
-                response.usage.prompt_tokens, response.usage.completion_tokens
-            )
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                self.update_token_count(
+                    getattr(usage, "prompt_tokens", 0) or 0,
+                    getattr(usage, "completion_tokens", 0) or 0,
+                )
 
             return response.choices[0].message
 

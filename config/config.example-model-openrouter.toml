@@ -1,0 +1,45 @@
+# OpenManus configuration for OpenRouter (free tier, OpenAI-compatible API)
+#
+# Copy to config/config.toml and fill in your key:
+#     cp config/config.example-model-openrouter.toml config/config.toml
+#
+#     export OPENROUTER_API_KEY="sk-or-..."
+#
+# Free models are the ids ending in ":free" (or the "openrouter/free" router).
+# They are limited to ~20 requests/minute and 50 requests/day without any
+# purchased credits, so an agent run (one request per step) burns through
+# that quickly.
+#
+[llm]
+model = "google/gemini-2.5-flash:free"       # any OpenRouter model id
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${OPENROUTER_API_KEY}"
+max_tokens = 4096
+temperature = 0.0
+
+# Optional: attribution headers (OpenRouter shows them on the public leaderboard).
+# These are shared by every profile below.
+[llm.extra_headers]
+HTTP-Referer = "https://github.com/FoundationAgents/OpenManus"
+X-Title = "OpenManus"
+
+# Optional: a second profile with a different model.
+[llm.alt]
+model = "meta-llama/llama-3.3-70b-instruct:free"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${OPENROUTER_API_KEY}"
+max_tokens = 4096
+temperature = 0.0
+
+# Optional: a vision profile.
+[llm.vision]
+model = "google/gemini-2.5-flash:free"
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${OPENROUTER_API_KEY}"
+max_tokens = 4096
+temperature = 0.0
+supports_images = true
+
+# Optional: MCP servers. Leave empty to run without MCP.
+[mcp]
+server_reference = "app.mcp.server"
