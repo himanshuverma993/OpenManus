@@ -1,0 +1,60 @@
+# OpenManus configuration for a Kaggle notebook (free APIs only)
+#
+# Copy to config/config.toml:
+#     cp config/config.example-kaggle.toml config/config.toml
+#
+# Provide the keys as Kaggle secrets (Add-ons -> Secrets) or as environment
+# variables inside the notebook:
+#     import os
+#     os.environ["GROQ_API_KEY"] = ...
+#
+# ---------------------------------------------------------------------------
+# Everything below is automatic: no model is ever selected by hand.
+# ---------------------------------------------------------------------------
+# OpenManus queries Groq, Gemini and OpenRouter for the models that are
+# available right now, keeps the free ones that can do tool calling and uses
+# the best one. Whenever a provider is unavailable, rate limited, exhausted
+# or incompatible, the next provider takes over - a single working key is
+# enough to run OpenManus.
+#
+[llm]
+model = "auto"
+providers = ["groq", "gemini", "openrouter"]
+max_tokens = 8192
+temperature = 0.0
+max_retries = 2
+
+[providers.groq]
+api_key = "${GROQ_API_KEY}"
+max_candidates = 3
+free_only = true
+
+[providers.gemini]
+api_key = "${GEMINI_API_KEY}"
+max_candidates = 2
+free_only = true
+
+[providers.openrouter]
+api_key = "${OPENROUTER_API_KEY}"
+max_candidates = 2
+free_only = true
+
+# The search tool uses several engines with automatic fallback.
+[search]
+engine = "DuckDuckGo"
+fallback_engines = ["Baidu", "Bing", "Google"]
+retry_delay = 30
+max_retries = 2
+
+# The Docker sandbox is not available inside a Kaggle notebook - the local
+# tools (python_execute, str_replace, ...) are used instead.
+[sandbox]
+use_sandbox = false
+
+# Browser Use needs uvx, a local Chromium and a working package mirror, which
+# is not available on Kaggle. Disable it there:
+# OPENMANUS_DISABLE_BROWSER_USE=1
+
+# MCP servers are optional; leave empty to run without them.
+[mcp]
+server_reference = "app.mcp.server"

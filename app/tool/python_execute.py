@@ -52,24 +52,46 @@ class PythonExecute(BaseTool):
             Dict: Contains 'output' with execution output or error message and 'success' status.
         """
 
-        with multiprocessing.Manager() as manager:
-            result = manager.dict({"observation": "", "success": False})
-            if isinstance(__builtins__, dict):
-                safe_globals = {"__builtins__": __builtins__}
-            else:
-                safe_globals = {"__builtins__": __builtins__.__dict__.copy()}
-            proc = multiprocessing.Process(
-                target=self._run_code, args=(code, result, safe_globals)
-            )
-            proc.start()
-            proc.join(timeout)
+        try:
+            with multiprocessing.Manager() as manager:
+                result = manager.dict({"observation": "", "success": False})
+                if isinstance(__builtins__, dict):
+                    safe_globals = {"__builtins__": __builtins__}
+                else:
+                    safe_globals = {"__builtins__": __builtins__.__dict__.copy()}
+                proc = multiprocessing.Process(
+                    target=self._run_code, args=(code, result, safe_globals)
+                )
+                proc.start()
+                proc.join(timeout)
 
-            # timeout process
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(1)
-                return {
-                    "observation": f"Execution timeout after {timeout} seconds",
-                    "success": False,
-                }
-            return dict(result)
+                # timeout process
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(1)
+                    return {
+                        "observation": f"Execution timeout after {timeout} seconds",
+                        "success": False,
+                    }
+                return dict(result)
+        except Exception as exc:
+            # `multiprocessing` can be unavailable or restricted inside notebook
+            # kernels (e.g. when the start method is "spawn" and the notebook
+            # cannot be re-imported). Fall back to running the code inline so the
+            # agent keeps working, at the cost of losing the hard timeout.
+            result: Dict = {}
+            self._run_code(code, result, self._safe_globals())
+            result.setdefault("observation", "")
+            result.setdefault("success", False)
+            result["observation"] = (
+                f"{result['observation']}\n"
+                f"[note] executed without a timeout because multiprocessing was "
+                f"unavailable ({type(exc).__name__}: {exc})"
+            )
+            return result
+
+    @staticmethod
+    def _safe_globals() -> Dict:
+        if isinstance(__builtins__, dict):
+            return {"__builtins__": __builtins__}
+        return {"__builtins__": __builtins__.__dict__.copy()}

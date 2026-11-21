@@ -1,0 +1,61 @@
+# OpenManus configuration for Groq (free tier, OpenAI-compatible API)
+#
+# Copy to config/config.toml:
+#     cp config/config.example-model-groq.toml config/config.toml
+#
+# The `${GROQ_API_KEY}` placeholder is resolved from the environment at
+# runtime, so you never have to commit a real key:
+#     export GROQ_API_KEY="gsk_..."
+#
+# ---------------------------------------------------------------------------
+# AUTOMATIC MODE
+# ---------------------------------------------------------------------------
+# `model = "auto"` means: OpenManus asks Groq for the list of models that are
+# available *right now* (GET https://api.groq.com/openai/v1/models), filters
+# out everything that cannot be used for a tool calling agent, keeps the free
+# ones and picks the best of them. No model name ever has to be maintained
+# here - when Groq retires or adds a model, OpenManus follows automatically.
+#
+# If the key is missing, invalid, rate limited or the model stops working,
+# OpenManus rotates to the next model and then to the next provider. Add
+# `gemini` and/or `openrouter` to the `providers` list to get a full
+# fallback chain - any single working key is enough to run OpenManus.
+#
+[llm]
+model = "auto"                                 # discover the models at runtime
+providers = ["groq", "gemini", "openrouter"]   # fallback order
+max_tokens = 8192
+temperature = 0.0
+# max_input_tokens = 100000                   # optional hard cap across the run
+# max_retries = 2                             # retries per model before rotating
+
+# The provider chain can also be restricted to Groq only:
+# providers = ["groq"]
+
+# Per provider tuning. The API key is read from the environment when it is
+# not given explicitly.
+[providers.groq]
+api_key = "${GROQ_API_KEY}"
+max_candidates = 3      # how many Groq models are kept as fallbacks
+free_only = true        # only use zero-cost models
+# prefer = ["openai/gpt-oss-20b"]   # optional: try these models first
+
+# Uncomment to add more providers to the chain. They are only used when the
+# previous ones fail.
+# [providers.gemini]
+# api_key = "${GEMINI_API_KEY}"
+#
+# [providers.openrouter]
+# api_key = "${OPENROUTER_API_KEY}"
+
+# Optional: named profiles for the vision capable tools. They use the same
+# automatic discovery, so a vision model is picked at runtime as well.
+[llm.vision]
+model = "auto"
+providers = ["groq", "gemini", "openrouter"]
+max_tokens = 4096
+temperature = 0.0
+
+# Optional: MCP servers. Leave empty to run without MCP.
+[mcp]
+server_reference = "app.mcp.server"

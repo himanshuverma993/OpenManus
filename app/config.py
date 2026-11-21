@@ -1,10 +1,14 @@
 import json
+import os
+import re
 import threading
 import tomllib
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+from app.providers import BUILTIN_PROVIDERS, infer_family
 
 
 def get_project_root() -> Path:
@@ -15,19 +19,105 @@ def get_project_root() -> Path:
 PROJECT_ROOT = get_project_root()
 WORKSPACE_ROOT = PROJECT_ROOT / "workspace"
 
+# Environment variable placeholders such as ${GROQ_API_KEY} or ${GROQ_API_KEY:-fallback}
+# are expanded when the configuration file is loaded. This keeps secrets out of
+# config.toml, which is convenient for Kaggle secrets / CI environments.
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+# Keys inside the `[llm]` table that configure every profile instead of
+# declaring a new named profile.
+_LLM_SHARED_KEYS = ("extra_headers",)
+
+
+def expand_env_vars(value):
+    """Recursively expand ``${VAR}`` / ``${VAR:-default}`` placeholders."""
+    if isinstance(value, str):
+        return _ENV_VAR_PATTERN.sub(
+            lambda match: os.environ.get(match.group(1), match.group(2) or ""),
+            value,
+        )
+    if isinstance(value, dict):
+        return {key: expand_env_vars(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [expand_env_vars(item) for item in value]
+    return value
+
+
+class ProviderSettings(BaseModel):
+    """One OpenAI-compatible provider that the agent may talk to."""
+
+    name: str = Field(..., description="Provider name, e.g. 'groq'")
+    base_url: str = Field("", description="API base URL (empty -> provider default)")
+    api_key: str = Field("", description="API key (empty -> resolved from env)")
+    model: str = Field(
+        "auto",
+        description=(
+            "Model id. 'auto' discovers the currently available free models "
+            "from the provider's own /models endpoint."
+        ),
+    )
+    prefer: List[str] = Field(
+        default_factory=list,
+        description="Model ids to try first, in order (optional hint).",
+    )
+    free_only: bool = Field(True, description="Only use models that are free to call.")
+    max_candidates: int = Field(
+        3, description="How many models of this provider to keep as fallbacks."
+    )
+    extra_headers: Optional[Dict[str, str]] = Field(
+        None, description="Additional HTTP headers sent with every request."
+    )
+    family: str = Field(
+        "", description="Provider family (groq/gemini/openrouter/generic)."
+    )
+
 
 class LLMSettings(BaseModel):
     model: str = Field(..., description="Model name")
-    base_url: str = Field(..., description="API base URL")
-    api_key: str = Field(..., description="API key")
+    base_url: str = Field("", description="API base URL")
+    api_key: str = Field("", description="API key")
     max_tokens: int = Field(4096, description="Maximum number of tokens per request")
     max_input_tokens: Optional[int] = Field(
         None,
         description="Maximum input tokens to use across all requests (None for unlimited)",
     )
-    temperature: float = Field(1.0, description="Sampling temperature")
-    api_type: str = Field(..., description="Azure, Openai, or Ollama")
-    api_version: str = Field(..., description="Azure Openai version if AzureOpenai")
+    temperature: Optional[float] = Field(
+        1.0,
+        description=(
+            "Sampling temperature. Set to 'none' (or omit) to leave the parameter "
+            "out of the request entirely, which is required by some reasoning models."
+        ),
+    )
+    api_type: str = Field("", description="Azure, Openai, or Ollama")
+    api_version: str = Field("", description="Azure Openai version if AzureOpenai")
+    supports_images: Optional[bool] = Field(
+        None,
+        description=(
+            "Force-enable or force-disable image input support for this model. "
+            "When None the capability is auto-detected from the model name."
+        ),
+    )
+    extra_headers: Optional[Dict[str, str]] = Field(
+        None,
+        description="Additional HTTP headers sent with every request (e.g. OpenRouter attribution).",
+    )
+    providers: List[ProviderSettings] = Field(
+        default_factory=list,
+        description=(
+            "Ordered provider chain. The agent rotates to the next provider "
+            "whenever the current one fails."
+        ),
+    )
+    send_message_name: bool = Field(
+        False,
+        description=(
+            "Send messages[].name. Groq rejects that field with a 400 error, "
+            "so it is disabled by default."
+        ),
+    )
+    max_retries: int = Field(
+        2, description="Retries per candidate before rotating to the next one."
+    )
 
 
 class ProxySettings(BaseModel):
@@ -106,7 +196,10 @@ class SandboxSettings(BaseModel):
 
 
 class DaytonaSettings(BaseModel):
-    daytona_api_key: str
+    daytona_api_key: str = Field(
+        "",
+        description="Daytona API key. Only required when the Daytona sandbox is used.",
+    )
     daytona_server_url: Optional[str] = Field(
         "https://app.daytona.io/api", description=""
     )
@@ -230,22 +323,144 @@ class Config:
         with config_path.open("rb") as f:
             return tomllib.load(f)
 
+    @staticmethod
+    def _parse_temperature(value):
+        """Allow ``temperature = "none"`` to drop the parameter from requests."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"none", "null", "omit", "default"}:
+                return None
+            try:
+                return float(normalized)
+            except ValueError:
+                return None
+        return float(value)
+
+    @classmethod
+    def _finalize_llm_profile(cls, profile: dict) -> dict:
+        """Normalize a single LLM profile before it is validated."""
+        if "temperature" in profile:
+            profile["temperature"] = cls._parse_temperature(profile["temperature"])
+        if not profile.get("api_key"):
+            profile["api_key"] = os.environ.get("OPENMANUS_API_KEY", "")
+        return profile
+
+    @staticmethod
+    def _build_provider(name: str, overrides: dict) -> dict:
+        """Resolve one provider from the ``[providers.<name>]`` table."""
+        defaults = BUILTIN_PROVIDERS.get(name)
+        overrides = overrides or {}
+
+        base_url = overrides.get("base_url") or (defaults.base_url if defaults else "")
+        api_key = overrides.get("api_key") or ""
+
+        if not api_key and defaults:
+            for env_name in defaults.api_key_env:
+                api_key = os.environ.get(env_name, "")
+                if api_key:
+                    break
+
+        extra_headers = overrides.get("extra_headers")
+        if extra_headers is None and defaults:
+            extra_headers = dict(defaults.default_headers) or None
+
+        return {
+            "name": name,
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": overrides.get("model", "auto"),
+            "prefer": list(overrides.get("prefer", []) or []),
+            "free_only": bool(overrides.get("free_only", True)),
+            "max_candidates": int(overrides.get("max_candidates", 3)),
+            "extra_headers": extra_headers,
+            # The family is derived from the provider name so that a custom
+            # base URL (proxy, gateway, mock) keeps the provider specific
+            # catalogue rules.
+            "family": overrides.get("family") or infer_family(base_url, name),
+        }
+
+    @classmethod
+    def _resolve_providers(cls, profile: dict, provider_tables: dict) -> list:
+        """Build the ordered provider chain of an LLM profile.
+
+        Three modes are supported:
+
+        1. ``providers = ["groq", "gemini"]`` - an explicit fallback chain.
+        2. ``model``/``base_url`` set to a concrete model - the legacy single
+           provider mode.
+        3. ``model = "auto"`` - every built-in provider whose API key is
+           available in the environment is used, in the order they are declared.
+        """
+        names = profile.get("providers") or []
+        chain = []
+
+        if names:
+            for name in names:
+                chain.append(cls._build_provider(name, provider_tables.get(name, {})))
+        else:
+            model = profile.get("model")
+            base_url = profile.get("base_url")
+            if model and model != "auto" and base_url and base_url != "auto":
+                chain.append(
+                    {
+                        "name": "default",
+                        "base_url": base_url,
+                        "api_key": profile.get("api_key", ""),
+                        "model": model,
+                        "prefer": list(profile.get("prefer", []) or []),
+                        "free_only": bool(profile.get("free_only", True)),
+                        "max_candidates": int(profile.get("max_candidates", 3)),
+                        "extra_headers": profile.get("extra_headers"),
+                        "family": infer_family(base_url, "default"),
+                    }
+                )
+            else:
+                for name in BUILTIN_PROVIDERS:
+                    chain.append(
+                        cls._build_provider(name, provider_tables.get(name, {}))
+                    )
+
+        # A global key only makes sense when a single provider is configured.
+        if len(chain) == 1 and not chain[0]["api_key"]:
+            chain[0]["api_key"] = os.environ.get("OPENMANUS_API_KEY", "")
+
+        return chain
+
     def _load_initial_config(self):
-        raw_config = self._load_config()
+        raw_config = expand_env_vars(self._load_config())
         base_llm = raw_config.get("llm", {})
         llm_overrides = {
-            k: v for k, v in raw_config.get("llm", {}).items() if isinstance(v, dict)
+            k: v
+            for k, v in raw_config.get("llm", {}).items()
+            if isinstance(v, dict) and k not in _LLM_SHARED_KEYS
         }
+        shared_llm_settings = {
+            k: base_llm[k] for k in _LLM_SHARED_KEYS if k in base_llm
+        }
+
+        default_api_key = base_llm.get("api_key") or os.environ.get(
+            "OPENMANUS_API_KEY", ""
+        )
 
         default_settings = {
             "model": base_llm.get("model"),
-            "base_url": base_llm.get("base_url"),
-            "api_key": base_llm.get("api_key"),
+            "base_url": base_llm.get("base_url", ""),
+            "api_key": default_api_key,
             "max_tokens": base_llm.get("max_tokens", 4096),
             "max_input_tokens": base_llm.get("max_input_tokens"),
-            "temperature": base_llm.get("temperature", 1.0),
+            "temperature": self._parse_temperature(
+                base_llm["temperature"] if "temperature" in base_llm else 1.0
+            ),
             "api_type": base_llm.get("api_type", ""),
             "api_version": base_llm.get("api_version", ""),
+            "supports_images": base_llm.get("supports_images"),
+            "extra_headers": shared_llm_settings.get("extra_headers"),
+            # An explicit provider chain, e.g. providers = ["groq", "gemini"].
+            # When it is missing, "auto" mode builds the chain from every
+            # built-in provider whose API key is available.
+            "providers": base_llm.get("providers", []) or [],
         }
 
         # handle browser config.
@@ -310,11 +525,20 @@ class Config:
             run_flow_settings = RunflowSettings(**run_flow_config)
         else:
             run_flow_settings = RunflowSettings()
+        provider_tables = raw_config.get("providers", {}) or {}
+        if not isinstance(provider_tables, dict):
+            provider_tables = {}
+
+        def _build_profile(base: dict, override: dict) -> dict:
+            profile = self._finalize_llm_profile({**base, **override})
+            profile["providers"] = self._resolve_providers(profile, provider_tables)
+            return profile
+
         config_dict = {
             "llm": {
-                "default": default_settings,
+                "default": _build_profile(default_settings, {}),
                 **{
-                    name: {**default_settings, **override_config}
+                    name: _build_profile(default_settings, override_config)
                     for name, override_config in llm_overrides.items()
                 },
             },

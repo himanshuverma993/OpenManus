@@ -32,9 +32,20 @@ class ToolCallAgent(ReActAgent):
 
     tool_calls: List[ToolCall] = Field(default_factory=list)
     _current_base64_image: Optional[str] = None
+    _final_answer: Optional[str] = None
 
     max_steps: int = 30
     max_observe: Optional[Union[int, bool]] = None
+    finish_on_text_answer: bool = Field(
+        True,
+        description=(
+            "Stop the agent when the model answers with plain text instead of "
+            "calling a tool. Models served by the free tiers often do not "
+            "call the 'terminate' tool, and continuing would repeat the same "
+            "answer until the step limit is reached - wasting the (very "
+            "small) request quota of the provider."
+        ),
+    )
 
     async def think(self) -> bool:
         """Process current state and decide next actions using tools"""
@@ -56,8 +67,17 @@ class ToolCallAgent(ReActAgent):
             )
         except ValueError:
             raise
+        except TokenLimitExceeded as token_limit_error:
+            logger.error(f"🚨 Token limit error: {token_limit_error}")
+            self.memory.add_message(
+                Message.assistant_message(
+                    f"Maximum token limit reached, cannot continue execution: {str(token_limit_error)}"
+                )
+            )
+            self.state = AgentState.FINISHED
+            return False
         except Exception as e:
-            # Check if this is a RetryError containing TokenLimitExceeded
+            # Older retry wrappers surfaced the token limit as a RetryError.
             if hasattr(e, "__cause__") and isinstance(e.__cause__, TokenLimitExceeded):
                 token_limit_error = e.__cause__
                 logger.error(
@@ -116,6 +136,18 @@ class ToolCallAgent(ReActAgent):
 
             # For 'auto' mode, continue with content if no commands but content exists
             if self.tool_choices == ToolChoice.AUTO and not self.tool_calls:
+                if content and self.finish_on_text_answer:
+                    # The model answered with plain text and did not ask for a
+                    # tool: this is its final answer. Continuing would only
+                    # repeat the same answer until the step limit is reached
+                    # and would burn the request quota of the provider.
+                    logger.info(
+                        f"🏁 {self.name} produced a final answer without a tool "
+                        f"call - finishing the run."
+                    )
+                    self._final_answer = content
+                    self.state = AgentState.FINISHED
+                    return False
                 return bool(content)
 
             return bool(self.tool_calls)
@@ -127,6 +159,15 @@ class ToolCallAgent(ReActAgent):
                 )
             )
             return False
+
+    async def step(self) -> str:
+        """Execute a single step and surface the final answer of the model."""
+        should_act = await self.think()
+        if not should_act:
+            if self._final_answer:
+                return self._final_answer
+            return "Thinking complete - no action needed"
+        return await self.act()
 
     async def act(self) -> str:
         """Execute tool calls and handle their results"""

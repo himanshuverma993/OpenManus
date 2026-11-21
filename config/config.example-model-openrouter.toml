@@ -1,0 +1,59 @@
+# OpenManus configuration for OpenRouter (free tier, OpenAI-compatible API)
+#
+# Copy to config/config.toml:
+#     cp config/config.example-model-openrouter.toml config/config.toml
+#
+#     export OPENROUTER_API_KEY="sk-or-..."
+#
+# ---------------------------------------------------------------------------
+# AUTOMATIC MODE
+# ---------------------------------------------------------------------------
+# `model = "auto"` means: OpenManus asks OpenRouter for the live catalogue
+# (GET https://openrouter.ai/api/v1/models), keeps only the models whose
+# pricing is zero on both sides, drops the ones without tool calling support
+# and without the chat completions endpoint, and picks the best of them.
+# The ":free" suffix therefore never has to be hard coded.
+#
+# WARNING: without purchased credits, OpenRouter allows roughly 20 requests
+# per minute and 50 requests per day. An agent run sends one request per
+# step, so this provider alone is quickly exhausted - keep Groq or Gemini in
+# the chain as a fallback.
+#
+[llm]
+model = "auto"                                 # discover the models at runtime
+providers = ["openrouter", "groq", "gemini"]   # fallback order
+max_tokens = 4096
+temperature = 0.0
+
+# The provider chain can also be restricted to OpenRouter only:
+# providers = ["openrouter"]
+
+[providers.openrouter]
+api_key = "${OPENROUTER_API_KEY}"
+max_candidates = 2      # the free catalogue is large; keep the chain short
+free_only = true        # only use zero-cost models
+
+# Attribution headers (OpenRouter shows them on the public leaderboard).
+# They are added automatically for the built-in OpenRouter provider.
+# [llm.extra_headers]
+# HTTP-Referer = "https://github.com/FoundationAgents/OpenManus"
+# X-Title = "OpenManus"
+
+# Uncomment to add more providers to the chain.
+# [providers.groq]
+# api_key = "${GROQ_API_KEY}"
+#
+# [providers.gemini]
+# api_key = "${GEMINI_API_KEY}"
+
+# Optional: a named profile for the vision capable tools.
+[llm.vision]
+model = "auto"
+providers = ["openrouter", "gemini"]
+max_tokens = 4096
+temperature = 0.0
+supports_images = true
+
+# Optional: MCP servers. Leave empty to run without MCP.
+[mcp]
+server_reference = "app.mcp.server"
